@@ -1,6 +1,8 @@
 import os
 import uuid
 import json
+import asyncio
+import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,18 +12,25 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy import String, Text, select
 import redis.asyncio as aioredis
 
-DATABASE_URL = os.environ["DATABASE_URL"]
-REDIS_HOST   = os.environ.get("REDIS_HOST", "localhost")
-REDIS_PORT   = int(os.environ.get("REDIS_PORT", "6379"))
-APP_TITLE    = os.environ.get("APP_TITLE", "timeiq-api")
-CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "*").split(",")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ── Never crash at import time ────────────────────────────────────
+DATABASE_URL         = os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
+REDIS_HOST           = os.environ.get("REDIS_HOST", "localhost")
+REDIS_PORT           = int(os.environ.get("REDIS_PORT", "6379"))
+APP_TITLE            = os.environ.get("APP_TITLE", "timeiq-api")
+CORS_ORIGINS         = os.environ.get("CORS_ORIGINS", "*").split(",")
 REDIS_SOCKET_TIMEOUT = int(os.environ.get("REDIS_SOCKET_TIMEOUT", "5"))
-ITEMS_CACHE_KEY  = os.environ.get("ITEMS_CACHE_KEY", "items:all")
-ITEMS_CACHE_TTL  = int(os.environ.get("ITEMS_CACHE_TTL", "60"))
+ITEMS_CACHE_KEY      = os.environ.get("ITEMS_CACHE_KEY", "items:all")
+ITEMS_CACHE_TTL      = int(os.environ.get("ITEMS_CACHE_TTL", "60"))
 
 engine       = create_async_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 redis_client: aioredis.Redis | None = None
+
+# ── Readiness flag — health returns ok immediately ────────────────
+app_ready = False
 
 
 class Base(DeclarativeBase):
@@ -38,15 +47,35 @@ class Item(Base):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global redis_client
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    redis_client = aioredis.from_url(
-        f"redis://{REDIS_HOST}:{REDIS_PORT}",
-        decode_responses=True,
-        socket_timeout=REDIS_SOCKET_TIMEOUT,
-    )
+    global redis_client, app_ready
+
+    logger.info("Starting up — connecting to DB and Redis...")
+
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        logger.info("DB connection established")
+    except Exception as e:
+        logger.error(f"DB connection failed: {e}")
+        # Don't crash — let health endpoint still respond
+        # Cloud Run will retry
+
+    try:
+        redis_client = aioredis.from_url(
+            f"redis://{REDIS_HOST}:{REDIS_PORT}",
+            decode_responses=True,
+            socket_timeout=REDIS_SOCKET_TIMEOUT,
+        )
+        await redis_client.ping()
+        logger.info("Redis connection established")
+    except Exception as e:
+        logger.error(f"Redis connection failed: {e}")
+
+    app_ready = True
+    logger.info("App ready")
+
     yield
+
     await engine.dispose()
     if redis_client:
         await redis_client.aclose()
@@ -73,9 +102,10 @@ class ItemOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+# ── Health returns 200 immediately — does NOT wait for DB ─────────
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "ready": app_ready}
 
 
 @app.get("/ping-redis")
