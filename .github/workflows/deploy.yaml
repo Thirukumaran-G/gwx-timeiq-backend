@@ -31,7 +31,7 @@ jobs:
         run: pip install -r requirements.txt aiosqlite
 
       - name: Run tests
-        run: pytest tests/ -v --tb=short
+        run: pytest -v --tb=short
 
   build-scan-deploy:
     name: "Build → Scan → Deploy"
