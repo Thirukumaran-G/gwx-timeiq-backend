@@ -81,7 +81,7 @@ async def lifespan(app: FastAPI):
         await redis_client.aclose()
 
 
-app = FastAPI(title=APP_TITLE, lifespan=lifespan)
+app = FastAPI(title=APP_TITLE, lifespan=lifespan, root_path="/api")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
