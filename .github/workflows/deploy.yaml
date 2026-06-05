@@ -1,0 +1,118 @@
+name: "Backend — CI/CD"
+
+on:
+  push:
+    branches: [main, staging]
+  pull_request:
+    branches: [main, staging]
+
+permissions:
+  contents: read
+  id-token: write
+  security-events: write
+
+env:
+  PYTHON_VERSION: "3.12"
+  TERRAFORM_VERSION: "1.9.0"
+
+jobs:
+  test:
+    name: "Test"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt aiosqlite
+
+      - name: Run tests
+        run: pytest tests/ -v --tb=short
+
+  build-scan-deploy:
+    name: "Build → Scan → Deploy"
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name == 'main' && 'prod' || 'staging' }}
+    concurrency:
+      group: deploy-backend-${{ github.ref_name }}
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set environment variables
+        id: vars
+        run: |
+          ENV=${{ github.ref_name == 'main' && 'prod' || 'staging' }}   
+          echo "env=${ENV}" >> $GITHUB_OUTPUT
+          echo "image=${{ secrets.AR_URL }}/backend:${{ github.sha }}" >> $GITHUB_OUTPUT
+          echo "image_latest=${{ secrets.AR_URL }}/backend:latest" >> $GITHUB_OUTPUT
+          echo "service=${{ secrets.APP_NAME }}-api-${ENV}" >> $GITHUB_OUTPUT
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ steps.vars.outputs.env == 'prod' && secrets.BACKEND_DEPLOYER_SA_EMAIL_PROD || secrets.BACKEND_DEPLOYER_SA_EMAIL_STAGING }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ secrets.AR_REGION }}-docker.pkg.dev --quiet
+
+      - name: Build image
+        run: |
+          docker build \
+            --build-arg PORT=${{ secrets.BACKEND_PORT }} \
+            --build-arg PYTHON_VERSION=${{ env.PYTHON_VERSION }} \
+            -t ${{ steps.vars.outputs.image }} \
+            -t ${{ steps.vars.outputs.image_latest }} \
+            --label "git-sha=${{ github.sha }}" \
+            --label "environment=${{ steps.vars.outputs.env }}" \
+            .
+
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@0.20.0
+        with:
+          image-ref: ${{ steps.vars.outputs.image }}
+          format: sarif
+          output: trivy.sarif
+          severity: ${{ secrets.TRIVY_SEVERITY }}
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy.sarif
+
+      - name: Push image
+        run: |
+          docker push ${{ steps.vars.outputs.image }}
+          docker push ${{ steps.vars.outputs.image_latest }}
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy ${{ steps.vars.outputs.service }} \
+            --image ${{ steps.vars.outputs.image }} \
+            --region ${{ secrets.GCP_REGION }} \
+            --project ${{ secrets.GCP_PROJECT_ID }} \
+            --no-allow-unauthenticated \
+            --quiet
+
+      - name: Smoke test
+        run: |
+          URL=$(gcloud run services describe ${{ steps.vars.outputs.service }} \
+            --region ${{ secrets.GCP_REGION }} \
+            --project ${{ secrets.GCP_PROJECT_ID }} \
+            --format "value(status.url)")
+          STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $(gcloud auth print-identity-token)" \
+            "${URL}${{ secrets.HEALTH_CHECK_PATH }}")
+          [ "$STATUS" = "200" ] && echo "✅ Smoke test passed" \
+            || (echo "❌ Smoke test failed: ${STATUS}" && exit 1)
